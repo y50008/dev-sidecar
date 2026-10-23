@@ -5,11 +5,10 @@ import { fileURLToPath } from 'node:url'
 import DevSidecar from '@blue-frontier/dev-sidecar'
 import AdmZip from 'adm-zip'
 import electron from '../../electron.js'
-const { ipcMain } = electron
+const { ipcMain, net, session } = electron
 import electronUpdater from 'electron-updater'
 const { autoUpdater } = electronUpdater
 import request from 'request'
-import progress from 'request-progress'
 import { createRequire } from 'node:module'
 const require = createRequire(import.meta.url)
 const pkg = require('../../../package.json')
@@ -186,14 +185,21 @@ function downloadFile (uri, filePath, onProgress, onSuccess, onError) {
   }
   const writeStream = fs.createWriteStream(tempPath)
   let settled = false
-  let downloadRequest
+  let currentRequest = null
+  let idleTimer = null
+
   const fail = (err) => {
     if (settled) {
       return
     }
     settled = true
-    if (downloadRequest) {
-      downloadRequest.destroy()
+    if (idleTimer) {
+      clearTimeout(idleTimer)
+    }
+    try {
+      currentRequest?.abort()
+    } catch {
+      // ignore
     }
     writeStream.destroy()
     try {
@@ -204,40 +210,82 @@ function downloadFile (uri, filePath, onProgress, onSuccess, onError) {
     log.error('下载升级包失败:', err)
     onError(err)
   }
-  downloadRequest = request(uri, {
-    ca: getTrustedCaList(),
-    proxy: proxy.url,
-    // 只限制“等待响应”阶段，下载过程中的进度不会因此被中断
-    timeout: 60000,
-  }, (response) => {
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      fail(new Error(`下载升级包失败，HTTP status: ${response.statusCode}`))
+
+  const armIdleTimer = () => {
+    if (idleTimer) {
+      clearTimeout(idleTimer)
+    }
+    idleTimer = setTimeout(() => fail(new Error('下载升级包超时（60 秒无数据）')), 60000)
+  }
+
+  const finish = () => {
+    if (settled) {
       return
     }
-    progress(response, {})
-      .on('progress', (state) => {
-        onProgress(state.percent * 100)
-        log.log('progress', state.percent)
-      })
-      .on('error', fail)
-      .pipe(writeStream)
-      .on('error', fail)
-      .on('finish', () => {
+    try {
+      fs.rmSync(filePath, { force: true })
+      fs.renameSync(tempPath, filePath)
+    } catch (e) {
+      fail(e)
+      return
+    }
+    settled = true
+    if (idleTimer) {
+      clearTimeout(idleTimer)
+    }
+    onSuccess(filePath)
+  }
+
+  writeStream.on('error', fail)
+  writeStream.on('finish', finish)
+
+  // 用 Electron 的网络栈下载：GitHub 资产会 302 到 release-assets.githubusercontent.com，
+  // request 库经本地代理跟随这种跨域重定向时会挂起（2.3.3 之前自动更新卡 0 字节的原因）。
+  ;(async () => {
+    try {
+      const ses = session.fromPartition('update-download')
+      if (proxy.url) {
+        await ses.setProxy({ proxyRules: proxy.url })
+      }
+      const req = net.request({ url: uri, session: ses, redirect: 'follow' })
+      currentRequest = req
+      armIdleTimer()
+      req.on('response', (response) => {
         if (settled) {
           return
         }
-        try {
-          fs.rmSync(filePath, { force: true })
-          fs.renameSync(tempPath, filePath)
-        } catch (e) {
-          fail(e)
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          const hint = response.statusCode === 404 ? '（发布未公开或资产不存在）' : ''
+          fail(new Error(`下载升级包失败，HTTP status: ${response.statusCode}${hint}`))
           return
         }
-        settled = true
-        onSuccess(filePath)
+        const total = Number(response.headers['content-length'] || 0)
+        let received = 0
+        response.on('data', (chunk) => {
+          if (settled) {
+            return
+          }
+          armIdleTimer()
+          received += chunk.length
+          writeStream.write(chunk)
+          if (total > 0) {
+            onProgress(Math.min(100, received / total * 100))
+          }
+        })
+        response.on('end', () => {
+          if (!settled) {
+            writeStream.end()
+          }
+        })
+        response.on('aborted', () => fail(new Error('下载连接中断')))
+        response.on('error', fail)
       })
-  })
-  downloadRequest.on('error', fail)
+      req.on('error', fail)
+      req.end()
+    } catch (e) {
+      fail(e)
+    }
+  })()
 }
 
 /**
@@ -320,9 +368,13 @@ function updateHandle (app, api, win, beforeQuit, quit, log) {
           const isTimeout = error.code === 'ETIMEDOUT' || /timeout/i.test(String(error.message || ''))
           const proxyUnavailable = /ECONNREFUSED|tunneling socket could not be established|ECONNRESET/i.test(String(error.message || ''))
             || error.code === 'ECONNREFUSED'
+          // 代理/MITM 返回了非 HTTP 数据时，Node 的 HTTP 解析器会抛 Parse Error
+          const parseError = /Parse Error|HPE_INVALID|invalid response/i.test(String(error.message || ''))
           let errorMsg
           if (proxyUnavailable) {
             errorMsg = '代理未开启或未就绪，请先在首页开启加速服务后重试'
+          } else if (parseError) {
+            errorMsg = '检查更新失败：代理返回了异常响应，请关闭再重新开启加速服务后重试'
           } else if (isTimeout) {
             errorMsg = '检查更新超时（15 秒），请检查网络或系统代理后重试'
           } else {
