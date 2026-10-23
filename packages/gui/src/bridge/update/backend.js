@@ -16,10 +16,12 @@ const pkg = require('../../../package.json')
 import appPathUtil from '../../utils/util.apppath.js'
 import log from '../../utils/util.log.gui.js'
 import { isNewVersion } from '@blue-frontier/dev-sidecar/src/utils/util.version.js'
+import sudoPrompt from '@vscode/sudo-prompt'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const isMac = process.platform === 'darwin'
 const isLinux = process.platform === 'linux'
+const isWindows = process.platform === 'win32'
 
 const curVersion = pkg.version
 const isCurrentPreRelease = curVersion.includes('-')
@@ -55,8 +57,8 @@ function getTrustedCaList () {
 
 /**
  * 获取当前平台/架构对应的资源命名。
- * - partArch: 增量包命名用（win-x64 / win-arm64 / win-ia32）
- * - fullArch: 完整安装包命名用（windows-x86_64 / windows-arm64 / linux-armv7l 等）
+ * - partArch: 增量包命名用（<platform>-<arch>，如 win-x64 / mac-arm64 / linux-armv7l）
+ * - fullArch: 完整安装包命名用（windows-x86_64 / macos-arm64 / linux-armv7l 等）
  */
 function safeHostname (uri) {
   try {
@@ -128,8 +130,8 @@ function getPlatformAssetInfo () {
     partArch = 'arm64'
     fullArch = 'arm64'
   } else if (arch === 'arm') {
-    // 无 arm 增量包：不要回退到 x64 增量包，否则可能把不兼容补丁装到 ARM 安装上
-    partArch = null
+    // Linux armv7l：CI 已产出 update-linux-armv7l 增量包
+    partArch = 'armv7l'
     fullArch = 'armv7l'
   } else {
     partArch = 'x64'
@@ -549,6 +551,17 @@ function updateHandle (app, api, win, beforeQuit, quit, log) {
 
     log.info('开始解压缩，安装升级包:', partPackagePath, target)
 
+    if (!canWrite(target)) {
+      if (isWindows) {
+        // Windows 安装在 Program Files 时普通权限写不进 resources，请求 UAC 后由提权进程解压
+        await updatePartElevated(app, partPackagePath, target)
+        return
+      }
+      log.warn('安装目录不可写，改用完整安装包')
+      downloadFull(app, value)
+      return
+    }
+
     try {
       await beforeQuit()
       app.relaunch()
@@ -558,6 +571,54 @@ function updateHandle (app, api, win, beforeQuit, quit, log) {
       log.info('安装完成，重启app')
     } finally {
       app.exit(0)
+    }
+  }
+
+  function canWrite (dir) {
+    try {
+      fs.accessSync(dir, fs.constants.W_OK)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * 提权解压增量包：UAC 授权后由 PowerShell 结束当前进程、覆盖 resources、再重启应用。
+   * 用户取消 UAC 时当前进程仍在，发送错误提示，由用户决定稍后重试。
+   */
+  async function updatePartElevated (app, partPackagePath, target) {
+    const scriptPath = path.join(path.dirname(partPackagePath), 'apply-update.ps1')
+    const quote = p => String(p).replaceAll("'", "''")
+    const script = [
+      "$ErrorActionPreference = 'Stop'",
+      // 连同 mitmproxy 子进程一起结束，避免占用 resources 里的文件
+      `taskkill /PID ${process.pid} /T /F | Out-Null`,
+      'Start-Sleep -Milliseconds 800',
+      `Expand-Archive -LiteralPath '${quote(partPackagePath)}' -DestinationPath '${quote(target)}' -Force`,
+      `Start-Process -FilePath '${quote(app.getPath('exe'))}'`,
+    ].join('\r\n')
+    fs.writeFileSync(scriptPath, script, 'utf8')
+
+    const command = `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${scriptPath}"`
+    log.info('安装目录不可写，请求管理员权限解压增量包:', scriptPath)
+    try {
+      await new Promise((resolve, reject) => {
+        sudoPrompt.exec(command, { name: 'dev-sidecar' }, (error) => {
+          if (error) {
+            reject(error)
+          } else {
+            resolve()
+          }
+        })
+      })
+    } catch (e) {
+      log.warn('请求管理员权限失败:', e)
+      sendUpdateMessage({
+        key: 'error',
+        value: e,
+        error: `安装目录需要管理员权限，已取消增量更新：${e.message || e}`,
+      })
     }
   }
 
